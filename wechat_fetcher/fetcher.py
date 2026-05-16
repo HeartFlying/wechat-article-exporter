@@ -50,8 +50,19 @@ class WeChatArticleFetcher:
             self.session.headers["Cookie"] = self.cookie
         self._cutoff = None
 
-    def fetch_articles(self, days: int = 30, callback: Optional[Callable] = None) -> List[dict]:
-        self._cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).timestamp()
+    def fetch_articles(self, days: int = None, from_date: str = None,
+                        to_date: str = None, callback: Optional[Callable] = None) -> List[dict]:
+        if days is not None:
+            self._cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).timestamp()
+            self._end_ts = None
+        elif from_date is not None:
+            self._cutoff = datetime.fromisoformat(from_date).replace(
+                tzinfo=timezone.utc).timestamp()
+            self._end_ts = datetime.fromisoformat(to_date).replace(
+                tzinfo=timezone.utc).timestamp() if to_date else None
+        else:
+            self._cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).timestamp()
+            self._end_ts = None
         all_articles = []
         offset = 0
 
@@ -175,8 +186,11 @@ class WeChatArticleFetcher:
             if ts is None:
                 continue
             oldest_ts = min(oldest_ts, ts) if oldest_ts is not None else ts
-            if ts >= self._cutoff:
-                filtered.append(a)
+            if ts < self._cutoff:
+                continue
+            if self._end_ts is not None and ts > self._end_ts:
+                continue
+            filtered.append(a)
 
         stop = oldest_ts is not None and oldest_ts < self._cutoff
         return filtered, stop

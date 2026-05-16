@@ -7,17 +7,18 @@ import click
 
 from wechat_fetcher.storage import ParamStore
 from wechat_fetcher.fetcher import WeChatArticleFetcher, KeyExpiredError
+from wechat_fetcher.downloader import ArticleDownloader
+from wechat_fetcher.dedup import DedupIndex
+from wechat_fetcher.workflow import WorkflowEngine
 
 
 def _find_mitmdump() -> str:
-    """Locate the mitmdump executable within the current venv."""
     scripts_dir = os.path.join(os.path.dirname(sys.executable), "Scripts") if os.name == "nt" \
         else os.path.join(os.path.dirname(sys.executable), "..", "bin")
     exe = "mitmdump.exe" if os.name == "nt" else "mitmdump"
     path = os.path.join(scripts_dir, exe)
     if os.path.isfile(path):
         return path
-    # Fallback: rely on PATH
     return "mitmdump"
 
 
@@ -31,7 +32,7 @@ def main():
 @click.option("--port", default=8080, help="Proxy port (default: 8080)")
 @click.option("--listen-host", default="0.0.0.0", help="Listen address (default: 0.0.0.0)")
 @click.option("--show-ip", is_flag=True, help="Show local IP for phone proxy config")
-def start_proxy(port, listen_host, show_ip):  # noqa: F811
+def start_proxy(port, listen_host, show_ip):
     """Start MITM proxy to intercept WeChat requests and extract auth params."""
     print("WeChat Article Fetcher Proxy")
     print("=" * 60)
@@ -52,7 +53,6 @@ def start_proxy(port, listen_host, show_ip):  # noqa: F811
 
     print("Instructions:")
     if show_ip:
-        # Phone mode
         print(" [Phone Mode]")
         print("1. Configure your phone's Wi-Fi proxy:")
         print(f"   Server: <your computer IP>  Port: {port}")
@@ -65,7 +65,6 @@ def start_proxy(port, listen_host, show_ip):  # noqa: F811
         print("3. Open WeChat, find the target Official Account.")
         print("4. Tap 'View all articles' and scroll down to load more.")
     else:
-        # Desktop mode (default)
         print(" [Desktop Mode]")
         print("1. Set Windows system proxy:")
         print(f"   Win+I > Network & Internet > Proxy > Manual")
@@ -88,7 +87,7 @@ def start_proxy(port, listen_host, show_ip):  # noqa: F811
 
     cmd = [
         _find_mitmdump(),
-        "-s", "proxy_addon.py",
+        "-s", os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxy_addon.py"),
         "-p", str(port),
         "--listen-host", listen_host,
     ]
@@ -97,17 +96,17 @@ def start_proxy(port, listen_host, show_ip):  # noqa: F811
     except KeyboardInterrupt:
         print("\nProxy stopped.")
     except FileNotFoundError:
-        print(
-            "mitmdump not found. Please run: uv sync"
-        )
+        print("mitmdump not found. Please run: uv sync")
         sys.exit(1)
 
 
 @main.command()
 @click.option("--biz", required=True, help="The __biz value of the target account")
-@click.option("--days", default=30, help="Number of days to fetch (default: 30)")
+@click.option("--days", type=int, help="Number of days to fetch")
+@click.option("--from", "from_date", help="Start date (YYYY-MM-DD)")
+@click.option("--to", "to_date", help="End date (YYYY-MM-DD)")
 @click.option("--output", type=click.Path(writable=True), help="Write JSON to file instead of stdout")
-def fetch(biz, days, output):
+def fetch(biz, days, from_date, to_date, output):
     """Fetch article URLs from a WeChat Official Account."""
     store = ParamStore()
     params = store.load(biz)
@@ -136,13 +135,14 @@ def fetch(biz, days, output):
     click.echo(f"Params for {biz}")
     if key_age is not None:
         age_str = f"{key_age:.0f}s ago" if key_age < 3600 else f"{key_age / 3600:.1f}h ago"
-        freshness = "fresh" if key_age < 3600 else "⚠ may be expired"
+        freshness = "fresh" if key_age < 3600 else "[!] may be expired"
         click.echo(f"  Key extracted: {params['extracted_at']} ({age_str}) ({freshness})")
     if not params.get("pass_ticket") and not params.get("cookie"):
-        click.echo("  ⚠ Missing pass_ticket/cookie in stored params — re-capture with updated proxy")
+        click.echo("  [!] Missing pass_ticket/cookie in stored params — re-capture with updated proxy")
     click.echo()
 
-    click.echo(f"Fetching articles from last {days} days...")
+    date_label = f"last {days} days" if days else f"{from_date} to {to_date}"
+    click.echo(f"Fetching articles from {date_label}...")
     fetcher = WeChatArticleFetcher(
         biz=params["__biz"],
         uin=params["uin"],
@@ -153,7 +153,8 @@ def fetch(biz, days, output):
     )
 
     try:
-        articles = fetcher.fetch_articles(days=days, callback=None)
+        articles = fetcher.fetch_articles(
+            days=days, from_date=from_date, to_date=to_date)
     except KeyExpiredError as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
@@ -186,33 +187,124 @@ def fetch(biz, days, output):
 @main.command()
 @click.option("--verbose", is_flag=True, help="Show full key/uin values")
 def status(verbose):
-    """Show stored WeChat account parameters."""
+    """Show stored WeChat account parameters and dedup index."""
     store = ParamStore()
     accounts = store.list_accounts()
 
     if not accounts:
         click.echo("No stored accounts.")
         click.echo("Run 'start-proxy' and open a WeChat Official Account.")
-        return
+    else:
+        click.echo(f"Stored accounts ({store._params_dir}):\n")
+        for a in accounts:
+            biz = a["__biz"]
+            extracted = a.get("extracted_at", "?")
+            try:
+                et = datetime.fromisoformat(extracted)
+                age = (datetime.now(timezone.utc) - et).total_seconds()
+                age_str = f"{age:.0f}s ago" if age < 3600 else f"{age / 3600:.1f}h ago"
+                freshness = "fresh" if age < 3600 else "[!] may be expired"
+            except (ValueError, TypeError):
+                age_str = "?"
+                freshness = "?"
 
-    click.echo(f"Stored accounts ({store._path}):\n")
-    for a in accounts:
-        biz = a["__biz"]
-        extracted = a.get("extracted_at", "?")
-        try:
-            et = datetime.fromisoformat(extracted)
-            age = (datetime.now(timezone.utc) - et).total_seconds()
-            age_str = f"{age:.0f}s ago" if age < 3600 else f"{age / 3600:.1f}h ago"
-            freshness = "fresh" if age < 3600 else "⚠ may be expired"
-        except (ValueError, TypeError):
-            age_str = "?"
-            freshness = "?"
+            click.echo(f"  {biz}")
+            click.echo(f"    Extracted: {extracted} ({age_str}) {freshness}")
+            if verbose:
+                full = store.load(biz)
+                if full:
+                    click.echo(f"    uin: {full.get('uin', '?')}")
+                    click.echo(f"    key: {full.get('key', '?')}")
+            click.echo()
 
-        click.echo(f"  {biz}")
-        click.echo(f"    Extracted: {extracted} ({age_str}) {freshness}")
-        if verbose:
-            full = store.load(biz)
-            if full:
-                click.echo(f"    uin: {full.get('uin', '?')}")
-                click.echo(f"    key: {full.get('key', '?')}")
-        click.echo()
+    dedup = DedupIndex()
+    ds = dedup.stats()
+    click.echo(f"去重索引 ({dedup._index_path}):")
+    click.echo(f"  文章标题: {ds['total_titles']}  文章URL: {ds['total_urls']}  账号数: {ds['accounts']}")
+
+
+@main.command()
+@click.option("--input", "input_file", required=True, help="Path to articles JSON file")
+@click.option("--output-dir", help="Output directory (default: data/articles)")
+@click.option("--cookie", help="Cookie for WeChat authentication")
+@click.option("--start", default=0, help="Start index (default: 0)")
+@click.option("--end", type=int, help="End index (default: all)")
+def download(input_file, output_dir, cookie, start, end):
+    """Download articles and convert to Markdown."""
+    downloader = ArticleDownloader(output_dir=output_dir, cookie=cookie)
+
+    if not os.path.exists(input_file):
+        click.echo(f"Error: File not found: {input_file}", err=True)
+        sys.exit(1)
+
+    articles = downloader.load_articles(input_file)
+    click.echo(f"Loaded {len(articles)} articles from {input_file}")
+
+    if start >= len(articles):
+        click.echo(f"Error: Start index {start} exceeds article count", err=True)
+        sys.exit(1)
+
+    dedup = DedupIndex()
+    results = downloader.download_all(articles, start=start, end=end, dedup=dedup)
+
+    if results["failed"]:
+        click.echo(f"\nFailed articles:", err=True)
+        for item in results["failed"]:
+            click.echo(f"  - {item['title']}", err=True)
+            click.echo(f"    {item['url']}", err=True)
+
+
+@main.command()
+@click.option("--biz", multiple=True, help="Target account __biz (repeatable, e.g. --biz A --biz B)")
+@click.option("--all", "all_accounts", is_flag=True, help="Process all stored accounts")
+@click.option("--days", type=int, help="Fetch articles from last N days")
+@click.option("--from", "from_date", help="Start date (YYYY-MM-DD)")
+@click.option("--to", "to_date", help="End date (YYYY-MM-DD)")
+@click.option("--output-dir", help="Output directory (default: data/articles)")
+@click.option("--cookie", help="Cookie for WeChat authentication")
+@click.option("--wait-proxy", is_flag=True, help="Wait for proxy to capture params before starting")
+def run(biz, all_accounts, days, from_date, to_date, output_dir, cookie, wait_proxy):
+    """One-shot workflow: fetch → dedup → download (multi-account)."""
+    if not biz and not all_accounts:
+        click.echo("请指定 --biz 或 --all", err=True)
+        sys.exit(1)
+
+    store = ParamStore()
+    if all_accounts:
+        biz_list = [a["__biz"] for a in store.list_accounts()]
+        if not biz_list:
+            click.echo("无已存储账号。请先运行 start-proxy 并打开目标公众号。", err=True)
+            sys.exit(1)
+        click.echo(f"处理 {len(biz_list)} 个账号: {', '.join(biz_list)}")
+    else:
+        biz_list = list(biz)
+
+    engine = WorkflowEngine()
+    results = engine.run_all(
+        biz_list=biz_list,
+        days=days,
+        from_date=from_date,
+        to_date=to_date,
+        output_dir=output_dir,
+        wait_proxy=wait_proxy,
+        cookie=cookie,
+    )
+
+    # 摘要
+    total_success = len(results["success"])
+    total_skipped = len(results["skipped"])
+    total_failed = len(results["failed"])
+    total_errors = len(results["errors"])
+
+    print(f"\n{'=' * 50}")
+    print(f"工作流完成")
+    print(f"  成功: {total_success}  跳过: {total_skipped}  失败: {total_failed}")
+    if total_errors:
+        print(f"  参数错误: {total_errors}")
+        for e in results["errors"]:
+            print(f"    - {e['biz']}: {e['reason']}")
+
+    if total_errors == len(biz_list):
+        sys.exit(1)
+    elif total_errors > 0 or total_failed > 0:
+        sys.exit(2)
