@@ -1,0 +1,17 @@
+[project]
+name = "wechat-fetcher"
+version = "0.1.0"
+description = "微信公众号文章URL抓取工具"
+requires-python = ">=3.9"
+dependencies = [
+    "mitmproxy>=9.0.0,<10.0.0",
+    "requests>=2.28.0",
+    "click>=8.0.0",
+]
+
+[project.scripts]
+wechat-fetcher = "wechat_fetcher.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

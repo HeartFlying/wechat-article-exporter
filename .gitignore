@@ -1,0 +1,8 @@
+params.json
+__pycache__/
+*.pyc
+.mypy_cache/
+.venv/
+venv/
+.claude/
+mitmproxy-ca.pem
