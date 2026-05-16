@@ -49,13 +49,26 @@ class ParamStore:
             if os.path.exists(tmp):
                 os.unlink(tmp)
 
+    def _normalize(self, biz: str, data: dict) -> dict:
+        """兼容旧版嵌套格式 {biz: {params}} → 新版扁平格式 {params}。"""
+        if "__biz" in data:
+            return data
+        if biz in data and isinstance(data[biz], dict):
+            return data[biz]
+        # 兜底：遍历查找第一个包含 __biz 的嵌套 dict（用于 list_accounts 无 biz 上下文的场景）
+        for v in data.values():
+            if isinstance(v, dict) and "__biz" in v:
+                return v
+        return data
+
     def load(self, biz: str) -> Optional[dict]:
         path = self._biz_path(biz)
         if not path.exists():
             return None
         try:
             with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+            return self._normalize(biz, data)
         except (json.JSONDecodeError, IOError):
             return None
 
@@ -66,6 +79,7 @@ class ParamStore:
             try:
                 with open(f, "r", encoding="utf-8") as fh:
                     data = json.load(fh)
+                data = self._normalize(f.stem, data)
                 accounts.append({
                     "__biz": data.get("__biz", f.stem),
                     "extracted_at": data.get("extracted_at"),
@@ -87,6 +101,7 @@ class ParamStore:
             return {}
         try:
             with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+            return self._normalize(biz, data)
         except (json.JSONDecodeError, IOError):
             return {}

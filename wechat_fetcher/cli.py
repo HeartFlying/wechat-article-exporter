@@ -2,6 +2,7 @@ import os
 import subprocess
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 import click
 
@@ -173,9 +174,14 @@ def fetch(biz, days, from_date, to_date, output):
 
     if output:
         import json
-        with open(output, "w", encoding="utf-8") as f:
+        out_path = Path(output)
+        if out_path.is_dir():
+            out_path = out_path / f"articles_{biz}.json"
+            click.echo(f"Output is a directory, writing to {out_path}")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
-        click.echo(f"Written to {output}")
+        click.echo(f"Written to {out_path}")
     else:
         for i, r in enumerate(result, 1):
             click.echo(f"{i}. {r['title']}")
