@@ -1,5 +1,9 @@
 # WeChat Fetcher
 
+![Python](https://img.shields.io/badge/python-%3E%3D3.9-blue)
+![License](https://img.shields.io/github/license/HeartFlying/wechat-article-exporter)
+![Platform](https://img.shields.io/badge/platform-windows%20%7C%20macOS%20%7C%20linux-lightgrey)
+
 微信公众号文章抓取工具。通过 MITM 代理拦截微信客户端 HTTPS 流量提取认证参数，进而调用微信文章列表 API 抓取文章 URL，并支持一键下载为 Markdown。
 
 ## 功能
@@ -15,8 +19,9 @@
 需要 [uv](https://docs.astral.sh/uv/)（Python 包管理器）。
 
 ```bash
-# 进入项目目录
-cd wechat
+# 克隆仓库
+git clone https://github.com/HeartFlying/wechat-article-exporter.git
+cd wechat-article-exporter
 
 # 安装依赖并创建虚拟环境
 uv sync
