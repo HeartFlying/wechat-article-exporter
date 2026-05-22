@@ -1,3 +1,5 @@
+"""WeChat Fetcher CLI entry point."""
+
 from wechat_fetcher.cli import main
 
 if __name__ == "__main__":

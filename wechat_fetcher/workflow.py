@@ -5,7 +5,8 @@ import sys
 import time
 from typing import List, Optional
 
-from wechat_fetcher.storage import ParamStore
+from wechat_fetcher.config import get_config
+from wechat_fetcher.storage import ParamStore, ParamStatus
 from wechat_fetcher.fetcher import WeChatArticleFetcher, KeyExpiredError
 from wechat_fetcher.downloader import ArticleDownloader
 from wechat_fetcher.dedup import DedupIndex
@@ -15,13 +16,12 @@ class WorkflowEngine:
     WAIT_INTERVAL = 3  # --wait-proxy 轮询间隔（秒）
     WAIT_TIMEOUT = 300  # --wait-proxy 最长等待（秒）
 
-    def __init__(self, root_dir: str = None):
+    def __init__(self, root_dir: str = None, skip_expired_check: bool = False):
         if root_dir is None:
-            root_dir = os.path.join(os.path.dirname(os.path.dirname(
-                os.path.abspath(__file__))), "data")
+            root_dir = str(get_config().data_dir)
         self._root = root_dir
         self._store = ParamStore(root_dir=root_dir)
-        self._dedup = DedupIndex(root_dir=root_dir)
+        self._skip_expired_check = skip_expired_check
 
     def run(self, biz: str, days: int = None, from_date: str = None,
             to_date: str = None, output_dir: str = None, wait_proxy: bool = False,
@@ -34,6 +34,10 @@ class WorkflowEngine:
                 cookie: str = None) -> dict:
         results = {"success": [], "failed": [], "skipped": [], "errors": []}
 
+        # 首先检查所有账号的参数健康状态
+        if not self._skip_expired_check:
+            self._check_and_warn_expired(biz_list)
+
         for biz in biz_list:
             params = self._resolve_params(biz, wait_proxy)
             if params is None:
@@ -42,6 +46,17 @@ class WorkflowEngine:
                     "reason": "参数未就绪" if wait_proxy else "无已存储参数",
                 })
                 continue
+
+            # 再次检查参数健康状态（通过 API 验证）
+            if not self._skip_expired_check:
+                health = self._store.check_health(biz)
+                if health.is_expired:
+                    print(f"[!] 账号 {health.name or biz} 的参数已过期，跳过")
+                    results["errors"].append({
+                        "biz": biz,
+                        "reason": f"参数已过期: {health.message}",
+                    })
+                    continue
 
             try:
                 self._process_biz(biz, params, days, from_date, to_date,
@@ -53,6 +68,23 @@ class WorkflowEngine:
                 })
 
         return results
+
+    def _check_and_warn_expired(self, biz_list: List[str]) -> None:
+        """检查并提醒已过期的账号（通过 API 验证）。"""
+        expired = []
+
+        for biz in biz_list:
+            health = self._store.check_health(biz)
+            if health.is_expired:
+                expired.append(health)
+
+        if expired:
+            print("\n" + "=" * 50)
+            print("[!] 以下账号参数已过期，将被跳过:")
+            for h in expired:
+                print(f"    - {h.name or h.biz}: {h.message}")
+            print(f"\n请运行: start-proxy 重新获取参数")
+            print("=" * 50 + "\n")
 
     def _resolve_params(self, biz: str, wait_proxy: bool) -> Optional[dict]:
         params = self._store.load(biz)
@@ -78,7 +110,10 @@ class WorkflowEngine:
 
     def _process_biz(self, biz: str, params: dict, days: int, from_date: str,
                      to_date: str, output_dir: str, cookie: str, results: dict) -> None:
-        label = f"[{biz[:16]}...]"
+        # 获取公众号名称用于显示和目录组织
+        account_name = params.get("name", "")
+        display_name = account_name if account_name else biz[:16]
+        label = f"[{display_name}]"
         print(f"\n{label} 开始抓取...")
 
         fetcher = WeChatArticleFetcher(
@@ -93,13 +128,16 @@ class WorkflowEngine:
         articles = fetcher.fetch_articles(
             days=days, from_date=from_date, to_date=to_date)
 
+        # 为该公众号创建独立的去重索引
+        dedup = DedupIndex(root_dir=self._root)
+
         # 去重
         new_articles = []
         skipped_count = 0
         for a in articles:
             title = a.get("title", "")
             url = a.get("url", "")
-            if self._dedup.is_duplicate(biz, title, url):
+            if dedup.is_duplicate(account_name, title, url):
                 skipped_count += 1
             else:
                 new_articles.append(a)
@@ -113,23 +151,35 @@ class WorkflowEngine:
 
         print(f"{label} {len(articles)} 篇 → {len(new_articles)} 篇新文章，开始下载...")
 
+        # 确定输出目录：使用公众号子目录
+        if output_dir:
+            base_output_dir = output_dir
+        else:
+            base_output_dir = self._root
+
         downloader = ArticleDownloader(
-            output_dir=output_dir or os.path.join(self._root, "articles"),
+            output_dir=base_output_dir,
             cookie=cookie or params.get("cookie", ""),
         )
 
         for i, a in enumerate(new_articles, 1):
-            title = a.get("title", "无标题")
+            title = a.get("title", "")
             url = a.get("url", "")
             date = a.get("date", "")
 
             safe_title = downloader.sanitize_filename(title)
             folder_name = f"{date}_{safe_title}" if date else safe_title
-            article_dir = downloader.output_dir / folder_name
+
+            # 检查文件是否存在（考虑公众号子目录）
+            if account_name:
+                safe_account = downloader.sanitize_filename(account_name)
+                article_dir = downloader.output_dir / safe_account / folder_name
+            else:
+                article_dir = downloader.output_dir / folder_name
 
             if article_dir.exists() and (article_dir / "content.md").exists():
                 results["skipped"].append({"biz": biz, "title": title, "url": url})
-                self._dedup.mark_seen(biz, title, url)
+                dedup.mark_seen(account_name, title, url)
                 continue
 
             print(f"  [{i}/{len(new_articles)}] 下载: {title}")
@@ -139,11 +189,11 @@ class WorkflowEngine:
                 continue
 
             content = downloader.extract_article_content(html)
-            filepath = downloader.save_article(title, content, date)
+            filepath = downloader.save_article(title, content, date, account_name=account_name)
 
             if filepath:
                 results["success"].append({"biz": biz, "title": title, "url": url, "file": filepath})
-                self._dedup.mark_seen(biz, title, url)
+                dedup.mark_seen(account_name, title, url)
             else:
                 results["failed"].append({"biz": biz, "title": title, "url": url})
 

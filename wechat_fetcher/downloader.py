@@ -12,6 +12,8 @@ import requests
 from bs4 import BeautifulSoup
 from markdownify import markdownify
 
+from wechat_fetcher.config import get_config
+
 
 class ArticleDownloader:
     """Download WeChat articles and save as Markdown."""
@@ -30,8 +32,9 @@ class ArticleDownloader:
 
     def __init__(self, output_dir: str = None, cookie: str = None):
         if output_dir is None:
-            output_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "articles")
+            output_dir = str(get_config().articles_dir)
         self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         self.cookie = cookie
         self.session = requests.Session()
         self.session.headers.update({
@@ -115,8 +118,16 @@ class ArticleDownloader:
 
         return f"# {title}\n\n{md}\n"
 
-    def save_article(self, title: str, content: str, date: str = None) -> Optional[str]:
-        """Save article as Markdown file in title-named folder."""
+    def save_article(self, title: str, content: str, date: str = None,
+                     account_name: str = None) -> Optional[str]:
+        """Save article as Markdown file in title-named folder.
+
+        Args:
+            title: 文章标题
+            content: 文章内容
+            date: 文章日期
+            account_name: 公众号名称，用于创建子目录
+        """
         safe_title = self.sanitize_filename(title)
         if not safe_title:
             safe_title = f"article_{int(time.time())}"
@@ -126,7 +137,13 @@ class ArticleDownloader:
         else:
             folder_name = safe_title
 
-        article_dir = self.output_dir / folder_name
+        # 如果有公众号名称，创建子目录
+        if account_name:
+            safe_account = self.sanitize_filename(account_name)
+            article_dir = self.output_dir / safe_account / folder_name
+        else:
+            article_dir = self.output_dir / folder_name
+
         article_dir.mkdir(parents=True, exist_ok=True)
 
         filename = "content.md"
@@ -138,22 +155,36 @@ class ArticleDownloader:
         return str(filepath)
 
     def download_all(self, articles: List[dict], start: int = 0, end: int = None,
-                      dedup=None) -> dict:
-        """Download all articles and save as Markdown."""
+                      dedup=None, account_name: str = None) -> dict:
+        """Download all articles and save as Markdown.
+
+        Args:
+            articles: 文章列表
+            start: 起始索引
+            end: 结束索引
+            dedup: 去重索引对象
+            account_name: 公众号名称，用于创建子目录
+        """
         if end is None:
             end = len(articles)
 
         articles_to_download = articles[start:end]
         total = len(articles_to_download)
-        
+
         results = {
             "success": [],
             "failed": [],
             "skipped": []
         }
 
+        # 显示输出目录，包含公众号子目录
+        display_dir = self.output_dir
+        if account_name:
+            safe_account = self.sanitize_filename(account_name)
+            display_dir = self.output_dir / safe_account
+
         print(f"\n开始下载 {total} 篇文章...")
-        print(f"输出目录: {self.output_dir}\n")
+        print(f"输出目录: {display_dir}\n")
 
         for i, article in enumerate(articles_to_download, 1):
             title = article.get("title", "无标题")
@@ -162,28 +193,34 @@ class ArticleDownloader:
 
             safe_title = self.sanitize_filename(title)
             folder_name = f"{date}_{safe_title}" if date else safe_title
-            article_dir = self.output_dir / folder_name
+
+            # 检查文件是否存在（考虑公众号子目录）
+            if account_name:
+                safe_account = self.sanitize_filename(account_name)
+                article_dir = self.output_dir / safe_account / folder_name
+            else:
+                article_dir = self.output_dir / folder_name
 
             if article_dir.exists() and (article_dir / "content.md").exists():
                 print(f"[{i}/{total}] 跳过 (已存在): {title}")
                 results["skipped"].append({"title": title, "url": url})
                 continue
 
-            if dedup and dedup.is_duplicate(article.get("biz", ""), title, url):
+            if dedup and dedup.is_duplicate(account_name, title, url):
                 print(f"[{i}/{total}] 跳过 (去重): {title}")
                 results["skipped"].append({"title": title, "url": url})
                 continue
 
             print(f"[{i}/{total}] 下载: {title}")
-            
+
             html = self.download_article(url)
             if html is None:
                 results["failed"].append({"title": title, "url": url})
                 continue
 
             content = self.extract_article_content(html)
-            filepath = self.save_article(title, content, date)
-            
+            filepath = self.save_article(title, content, date, account_name=account_name)
+
             if filepath:
                 print(f"  [OK] 保存至: {filepath}")
                 results["success"].append({
@@ -192,7 +229,7 @@ class ArticleDownloader:
                     "file": filepath
                 })
                 if dedup:
-                    dedup.mark_seen(article.get("biz", ""), title, url)
+                    dedup.mark_seen(account_name, title, url)
             else:
                 print(f"  [FAIL] 保存失败")
                 results["failed"].append({"title": title, "url": url})
